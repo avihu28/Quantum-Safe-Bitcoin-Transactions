@@ -14,7 +14,7 @@ Standard Bitcoin transactions rely on ECDSA signatures over the secp256k1 curve.
 
 ### Our Approach
 
-QSB builds on [Binohash](https://eprint.iacr.org/2024/1371) (Linus, 2026), which uses a HORS-like one-time signature scheme embedded in Bitcoin Script. Binohash achieves transaction integrity through a proof-of-work puzzle based on signature sizes (`OP_SIZE`). However, this puzzle relies on the assumption that the smallest known ECDSA `r`-value cannot be improved — a quantum adversary running Shor's algorithm could compute the discrete logarithm of `r = 1`, breaking the puzzle entirely.
+QSB builds on [Binohash](https://robinlinus.com/binohash.pdf) (Linus, 2026), which uses a HORS-like one-time signature scheme embedded in Bitcoin Script. Binohash achieves transaction integrity through a proof-of-work puzzle based on signature sizes (`OP_SIZE`). However, this puzzle relies on the assumption that the smallest known ECDSA `r`-value cannot be improved — a quantum adversary running Shor's algorithm could compute the discrete logarithm of `r = 1`, breaking the puzzle entirely.
 
 QSB replaces this with a **hash-to-signature puzzle**: the script hashes a transaction-bound public key via `OP_RIPEMD160` and interprets the 20-byte output as a DER-encoded ECDSA signature. A random 20-byte string satisfies the DER structural constraints with probability ~2^-46 — providing the proof-of-work target. Since this puzzle depends only on the pre-image resistance of RIPEMD-160 (not on any elliptic curve assumption), it is **fully resistant to Shor's algorithm**.
 
@@ -167,7 +167,7 @@ The computation is embarrassingly parallel — wall-clock time scales inversely 
 
 ## References
 
-- [Binohash: Signing Bitcoin Transactions via Proof of Work](https://eprint.iacr.org/2024/1371) — Robin Linus, 2026
+- [Binohash: Transaction Introspection Without Softforks](https://robinlinus.com/binohash.pdf) — Robin Linus, 2026
 - [Signing a Bitcoin Transaction with Lamport Signatures (no OP_CAT)](https://groups.google.com/g/bitcoindev/c/mR53go5gHIk) — Ethan Heilman, 2024
 
 ## License
