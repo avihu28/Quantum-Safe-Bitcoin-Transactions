@@ -40,7 +40,7 @@ from secp256k1 import (
     sha256d, ripemd160, hash160,
     compress_pubkey, decompress_pubkey, point_mul, point_add, G, N, P,
     ecdsa_sign, ecdsa_sign_with_k, ecdsa_recover, ecdsa_verify,
-    encode_der_sig, is_valid_der_sig, modinv, int_to_der_int,
+    encode_der_sig, is_valid_der_sig, parse_der, modinv, int_to_der_int,
 )
 from bitcoin_tx import (
     Transaction, TxIn, TxOut, QSBScriptBuilder,
@@ -597,7 +597,6 @@ def cmd_assemble(args):
     # ================================================================
     print("\n  [2] Pinning: recover key_puzzle")
     
-    from search_v2 import parse_der
     
     sp_r, sp_s = parse_der(sig_puzzle_pin)
     if sp_r is None:
