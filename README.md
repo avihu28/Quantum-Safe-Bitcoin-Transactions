@@ -96,8 +96,8 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 
 ```
 ├── paper/
-│   ├── article.tex          # LaTeX source
-│   └── article.pdf          # Compiled paper
+│   ├── QSB.tex              # LaTeX source
+│   └── QSB.pdf              # Compiled paper
 ├── gpu/                     # CUDA GPU search code
 │   ├── qsb_allgpu.cu       # Pinning search (SHA-256d + EC recovery)
 │   ├── qsb_digest_gpu.cu   # Digest search (subset enumeration + EC)
@@ -117,8 +117,32 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 │   ├── qsb_run.py          # vast.ai fleet orchestration (multi-machine)
 │   └── run_qsb.sh          # All-in-one run script for vast.ai
 ├── script/                  # Full generated Bitcoin Scripts
+├── v16/                     # Current orchestrator — start here to run a search
+│   ├── qsb_orchestrator_v16.py  # Rents hosts, uploads bundle, drives the search
+│   ├── bundle/              # v16 CUDA kernels + search inputs (authoritative)
+│   ├── make_bundle.sh       # Packs bundle/ into the uploaded qsb_v16.zip
+│   ├── pipeline/            # Tx assembly and local verification
+│   ├── results/             # Pre-computed pinning + R1 hit
+│   └── verify_r2_hit.py     # CPU re-derivation of a GPU hit
+├── config_a/                # Config A working tree: runbooks, regtest, verify/
+├── verifier/                # Rust consensus verifier (libbitcoinconsensus)
+├── transactions/            # Funding and spending transactions (hex)
+├── requirements.txt
 └── README.md
 ```
+
+### Which GPU sources are current?
+
+`v16/bundle/` holds the kernels actually used by the current orchestrator. They
+carry the `gpu_scalar_mulmod` carry-propagation fix that eliminated the R2 false
+positives — see [`v16/README.md`](v16/README.md). The copies under `gpu/` and
+`config_a/gpu/` predate that fix and are kept for reference.
+
+### Files not in this repository
+
+`qsb_state.json`, `qsb_solution.json`, and the assembled spending transaction
+are deliberately excluded: they contain the HORS preimages and ECDSA nonces that
+constitute the spending witness. Regenerate them with `pipeline/qsb_pipeline.py`.
 
 ## Status
 

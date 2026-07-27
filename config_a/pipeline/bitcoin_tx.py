@@ -193,20 +193,108 @@ def serialize_varint(n):
 
 def find_and_delete(script, sig_data):
     """
-    Remove all occurrences of push_data(sig_data) from script.
-    This is the FindAndDelete operation applied before sighash computation.
+    Bitcoin Core-compatible FindAndDelete.
+
+    Removes all occurrences of push_data(sig_data) from script, but ONLY
+    when the pattern aligns with an opcode boundary. Bitcoin Core's
+    implementation uses GetOp to iterate over opcodes and only removes
+    the pattern when it matches at the current pc position (between opcodes):
+
+        iterator pc = begin();
+        opcodetype opcode;
+        do {
+            while (end() - pc >= (long)b.size()
+                   && memcmp(&pc[0], &b[0], b.size()) == 0) {
+                pc = erase(pc, pc + b.size());
+                ++nFound;
+            }
+        } while (GetOp(pc, opcode));
+
+    The outer `do-while` advances past one opcode per iteration via GetOp.
+    The inner `while` greedily removes all consecutive matches at pc.
+
+    This matters because a naive byte-level scan can remove a pattern that
+    appears INSIDE a data push, which Bitcoin Core does not. For our QSB
+    scheme the pattern is always `push_data(sig)` which starts with the
+    1-byte push opcode 0x09 (for 9-byte sigs); matches inside a push would
+    be highly improbable but we stay correct to avoid consensus divergence.
     """
     pattern = push_data(sig_data)
-    result = b''
-    i = 0
-    while i <= len(script) - len(pattern):
-        if script[i:i+len(pattern)] == pattern:
-            i += len(pattern)
+    result = bytearray()
+    pc = 0
+    script_len = len(script)
+
+    while pc < script_len:
+        # Inner loop: while pattern matches at pc, skip it
+        while (script_len - pc >= len(pattern)
+               and script[pc:pc + len(pattern)] == pattern):
+            pc += len(pattern)
+
+        if pc >= script_len:
+            break
+
+        # Emit one opcode's worth of bytes, advancing pc past it
+        op = script[pc]
+        if op == 0 or (0x51 <= op <= 0x60) or op > 0x60:
+            # Non-push opcode (or OP_0 / OP_1..OP_16): 1 byte
+            result.append(op)
+            pc += 1
+        elif 1 <= op <= 0x4b:
+            # Direct push of `op` bytes
+            end = pc + 1 + op
+            if end > script_len:
+                # Malformed: copy rest and stop
+                result += script[pc:script_len]
+                pc = script_len
+            else:
+                result += script[pc:end]
+                pc = end
+        elif op == 0x4c:  # OP_PUSHDATA1
+            if pc + 1 >= script_len:
+                result += script[pc:script_len]
+                pc = script_len
+            else:
+                sz = script[pc + 1]
+                end = pc + 2 + sz
+                if end > script_len:
+                    result += script[pc:script_len]
+                    pc = script_len
+                else:
+                    result += script[pc:end]
+                    pc = end
+        elif op == 0x4d:  # OP_PUSHDATA2
+            if pc + 2 >= script_len:
+                result += script[pc:script_len]
+                pc = script_len
+            else:
+                sz = script[pc + 1] | (script[pc + 2] << 8)
+                end = pc + 3 + sz
+                if end > script_len:
+                    result += script[pc:script_len]
+                    pc = script_len
+                else:
+                    result += script[pc:end]
+                    pc = end
+        elif op == 0x4e:  # OP_PUSHDATA4
+            if pc + 4 >= script_len:
+                result += script[pc:script_len]
+                pc = script_len
+            else:
+                sz = (script[pc + 1] | (script[pc + 2] << 8)
+                      | (script[pc + 3] << 16) | (script[pc + 4] << 24))
+                end = pc + 5 + sz
+                if end > script_len:
+                    result += script[pc:script_len]
+                    pc = script_len
+                else:
+                    result += script[pc:end]
+                    pc = end
         else:
-            result += bytes([script[i]])
-            i += 1
-    result += script[i:]
-    return result
+            # Should be unreachable given the conditions above, but be safe
+            result.append(op)
+            pc += 1
+
+    return bytes(result)
 
 
 # ============================================================
@@ -495,35 +583,130 @@ class QSBScriptBuilder:
     
     @staticmethod
     def count_opcodes(script):
-        """Count non-push opcodes (>= 0x60) in a script, matching Bitcoin Core's rule.
-        
-        Returns (total_nonpush_ops, details_dict).
+        """Count non-push opcodes matching Bitcoin Core's MAX_OPS_PER_SCRIPT rule.
+
+        Bitcoin Core: `if (opcode > OP_16 && ++nOpCount > MAX_OPS_PER_SCRIPT)`.
+        OP_16 == 0x60, so opcodes STRICTLY GREATER than 0x60 count.
+        OP_0 (0x00), OP_1..OP_16 (0x51..0x60) and data pushes (0x01..0x4e) do NOT count.
+
+        IMPORTANT: This is the STATIC count only. OP_CHECKMULTISIG and
+        OP_CHECKMULTISIGVERIFY add their `nKeysCount` (the N value) to
+        nOpCount at runtime. Use count_opcodes_runtime() for the full check.
+
+        Returns static_count (int).
         """
         i = 0
         count = 0
         while i < len(script):
             op = script[i]
-            if op == 0:  # OP_0
+            if op == 0:  # OP_0 (push empty)
                 i += 1
-            elif 1 <= op <= 75:  # direct push
+            elif 1 <= op <= 75:  # direct push of 1-75 bytes
                 i += 1 + op
             elif op == 0x4c:  # OP_PUSHDATA1
                 if i + 1 < len(script):
-                    sz = script[i+1]
+                    sz = script[i + 1]
                     i += 2 + sz
                 else:
                     i += 1
             elif op == 0x4d:  # OP_PUSHDATA2
                 if i + 2 < len(script):
-                    sz = script[i+1] | (script[i+2] << 8)
+                    sz = script[i + 1] | (script[i + 2] << 8)
                     i += 3 + sz
                 else:
                     i += 1
+            elif op == 0x4e:  # OP_PUSHDATA4
+                if i + 4 < len(script):
+                    sz = (script[i + 1] | (script[i + 2] << 8)
+                          | (script[i + 3] << 16) | (script[i + 4] << 24))
+                    i += 5 + sz
+                else:
+                    i += 1
             else:
-                if op >= 0x60:  # OP_16 and above count
+                # Bitcoin Core: `if (opcode > OP_16 && ...)`
+                # OP_16 = 0x60. So op > 0x60 counts.
+                if op > 0x60:
                     count += 1
                 i += 1
         return count
+
+    @staticmethod
+    def count_opcodes_runtime(script):
+        """Count opcodes INCLUDING the dynamic CHECKMULTISIG addition.
+
+        Bitcoin Core's OP_CHECKMULTISIG does:
+            nOpCount += nKeysCount;   // N value popped from stack
+            if (nOpCount > MAX_OPS_PER_SCRIPT) return OP_COUNT_ERROR;
+
+        nKeysCount is the value that was pushed RIGHT BEFORE CHECKMULTISIG.
+        We detect it by looking at the preceding push instruction statically.
+        This assumes the N value is a literal number push (as it is in our
+        scripts) rather than computed at runtime.
+
+        Returns (total_runtime_count, n_values_for_multisigs).
+        """
+        i = 0
+        count = 0
+        multisig_ns = []
+        last_pushed_n = None  # tracks the most recent number pushed (for CHECKMULTISIG)
+
+        while i < len(script):
+            op = script[i]
+
+            # Determine what was pushed (so we can detect the N before CHECKMULTISIG)
+            if op == 0:  # OP_0 pushes empty/0
+                last_pushed_n = 0
+                i += 1
+                continue
+            if 1 <= op <= 75:
+                # Direct push of `op` bytes; treat as number if it's 1 byte
+                if op == 1 and i + 1 < len(script):
+                    last_pushed_n = script[i + 1]
+                else:
+                    last_pushed_n = None  # not a small number
+                i += 1 + op
+                continue
+            if op == 0x4c:
+                sz = script[i + 1] if i + 1 < len(script) else 0
+                last_pushed_n = None
+                i += 2 + sz
+                continue
+            if op == 0x4d:
+                sz = (script[i + 1] | (script[i + 2] << 8)) if i + 2 < len(script) else 0
+                last_pushed_n = None
+                i += 3 + sz
+                continue
+            if op == 0x4e:
+                sz = 0
+                if i + 4 < len(script):
+                    sz = (script[i + 1] | (script[i + 2] << 8)
+                          | (script[i + 3] << 16) | (script[i + 4] << 24))
+                last_pushed_n = None
+                i += 5 + sz
+                continue
+
+            # OP_1..OP_16 push 1..16 but don't count toward nOpCount
+            if 0x51 <= op <= 0x60:
+                last_pushed_n = op - 0x50
+                i += 1
+                continue
+
+            # Real opcode (op > OP_16)
+            count += 1
+
+            # OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY add N keys to nOpCount
+            if op == 0xae or op == 0xaf:
+                if last_pushed_n is None:
+                    raise ValueError(
+                        "CHECKMULTISIG without a literal N push right before it - "
+                        "cannot statically compute runtime op count")
+                count += last_pushed_n
+                multisig_ns.append(last_pushed_n)
+
+            last_pushed_n = None
+            i += 1
+
+        return count, multisig_ns
     
     def get_round_script_code(self, round_idx, sig_nonce_bytes, selected_dummy_sigs):
         """

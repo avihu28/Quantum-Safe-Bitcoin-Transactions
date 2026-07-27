@@ -1,0 +1,50 @@
+# --- Secrets / spend-authorizing material — never commit ---------------------
+# qsb_state.json holds every HORS preimage (hors_secrets) plus the ECDSA
+# nonces (pin_k, round_sigs[].k). qsb_solution.json and the assembled
+# spending tx hold the revealed preimages for the signed subset. Publishing
+# any of these before broadcast hands over the spending witness.
+qsb_state.json
+qsb_solution.json
+v16/pipeline/qsb_raw_tx.hex
+
+# Local runtime state (vast.ai instance ids, ssh hosts)
+.qsb_orchestrator_state.json
+.qsb_fleet_state.json
+
+# --- Generated artifacts -----------------------------------------------------
+# Rebuild with v16/make_bundle.sh; sources are tracked in v16/bundle/
+v16/qsb_v16.zip
+
+# Run outputs. Listed per-path rather than as a blanket `results/`: git does not
+# descend into an excluded directory, so a `!v16/results/...` negation under one
+# would never take effect.
+/results/
+config_a/results/
+v16/results/*
+!v16/results/r2_only_pinning.txt
+!v16/results/r2_only_round1.txt
+inspect/
+logs/
+
+# GTable cache built on the GPU host
+/tmp/secp256k1_gtable.bin
+
+# --- Build output ------------------------------------------------------------
+target/
+__pycache__/
+*.pyc
+qsb_allgpu
+qsb_search
+qsb_digest_gpu
+qsb_real
+qsb_digest
+verify_gpu
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.synctex.gz
+
+# OS
+.DS_Store

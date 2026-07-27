@@ -1,6 +1,9 @@
 /*
  * qsb_allgpu.cu — All-GPU QSB Pinning Search with SHA-256 midstate trick
  *
+ * SHA-256 double hash puzzle: checks both SHA-256(key) and SHA-256(SHA-256(key))
+ * per candidate, doubling the DER probability for ~0.8% extra cost.
+ *
  * Key optimization: CPU precomputes SHA-256 state after 78 blocks (4992 bytes).
  * GPU only finalizes the last block (16 bytes: tail + locktime + sighash_type)
  * + second SHA-256 (32 bytes). Total: 2 SHA-256 compresses per thread.
@@ -8,9 +11,9 @@
  * Full GPU pipeline per thread:
  *   1. Finalize SHA-256 (1 block) + second SHA-256 (1 block) = SHA-256d
  *   2. Scalar mul: u1 = neg_r_inv * z mod N
- *   3. EC: Q = u1*G + u2R  (CudaBrainSecp GTable)
- *   4. Hash160(compress(Q))
- *   5. DER check
+ *   3. EC: Q1 = u1*G + u2R, Q2 = Q1 + neg_2u2R (both recovery flags)
+ *   4. Batch ModInv (Montgomery trick on Q1.z, Q2.z)
+ *   5. SHA-256(compress(Qi)) → DER check × 2 pubkeys × 2 hashes = 4 checks
  *
  * Build:
  *   nvcc -O3 -o qsb_allgpu qsb_allgpu.cu -lcrypto -lm
@@ -187,7 +190,7 @@ __device__ void gpu_scalar_mulmod(uint64_t r[4], const uint64_t a[4], const uint
 }
 
 /* ============================================================
- * ALL-GPU kernel: midstate SHA-256d + scalar mul + EC + Hash160 + DER
+ * ALL-GPU kernel: midstate SHA-256d + scalar mul + EC + SHA-256 + double hash DER
  *
  * Inputs:
  *   d_midstate[8]:    SHA-256 state after processing first 78 blocks (4992 bytes)
@@ -209,6 +212,7 @@ __global__ void kernel_allgpu_pinning(
     uint32_t start_lt,
     const uint64_t *d_neg_r_inv,
     const uint64_t *d_u2rx, const uint64_t *d_u2ry,
+    const uint64_t *d_neg2u2rx, const uint64_t *d_neg2u2ry,
     uint8_t *d_gtX, uint8_t *d_gtY,
     uint32_t *d_hit_cnt, uint32_t *d_hit_idx,
     int batch_size, int easy_mode
@@ -261,15 +265,96 @@ __global__ void kernel_allgpu_pinning(
     uint64_t u1[4]; gpu_scalar_mulmod(u1,nri,z);
     uint16_t pk[16]; memcpy(pk,u1,32);
     uint64_t qx[4],qy[4]; _PointMultiSecp256k1(qx,qy,pk,d_gtX,d_gtY);
+
+    /* Q1 = u1*G + u2*R (recovery flag 0, even y) */
     uint64_t u2rx[4]={d_u2rx[0],d_u2rx[1],d_u2rx[2],d_u2rx[3]};
     uint64_t u2ry[4]={d_u2ry[0],d_u2ry[1],d_u2ry[2],d_u2ry[3]};
-    uint64_t qz[5]={1,0,0,0,0};
-    _PointAddSecp256k1(qx,qy,qz,u2rx,u2ry);
-    _ModInv(qz); uint64_t zz[4],zzz[4];
-    _ModMult(zz,qz,qz);_ModMult(zzz,zz,qz);_ModMult(qx,zz);_ModMult(qy,zzz);
-    uint8_t h160[20]; _GetHash160Comp(qx,(uint8_t)(qy[0]&1),h160);
-    int v=easy_mode?gpu_is_der_easy(h160,20):gpu_is_valid_der(h160,20);
-    if(v){uint32_t pos=atomicAdd(d_hit_cnt,1);if(pos<1024)d_hit_idx[pos]=(uint32_t)idx;}
+    uint64_t q1x[4],q1y[4],q1z[5];
+    memcpy(q1x,qx,32); memcpy(q1y,qy,32);
+    q1z[0]=1;q1z[1]=0;q1z[2]=0;q1z[3]=0;q1z[4]=0;
+    _PointAddSecp256k1(q1x,q1y,q1z,u2rx,u2ry);
+
+    /* Q2 = Q1 + neg_2u2R = u1*G - u2*R (recovery flag 1, odd y) */
+    uint64_t q2x[4],q2y[4],q2z[5];
+    memcpy(q2x,q1x,32); memcpy(q2y,q1y,32); memcpy(q2z,q1z,40);
+    uint64_t n2rx[4]={d_neg2u2rx[0],d_neg2u2rx[1],d_neg2u2rx[2],d_neg2u2rx[3]};
+    uint64_t n2ry[4]={d_neg2u2ry[0],d_neg2u2ry[1],d_neg2u2ry[2],d_neg2u2ry[3]};
+    _PointAddSecp256k1(q2x,q2y,q2z,n2rx,n2ry);
+
+    /* Batch ModInv: invert q1z and q2z with one inversion */
+    uint64_t prod[5];
+    _ModMult(prod,q1z,q2z);      /* prod = q1z * q2z */
+    _ModInv(prod);                /* prod = 1/(q1z*q2z) */
+    uint64_t inv1[5],inv2[5];
+    _ModMult(inv1,prod,q2z);      /* inv1 = q2z/(q1z*q2z) = 1/q1z */
+    _ModMult(inv2,prod,q1z);      /* inv2 = q1z/(q1z*q2z) = 1/q2z */
+
+    /* Normalize Q1 */
+    uint64_t zz[4],zzz[4];
+    _ModMult(zz,inv1,inv1);_ModMult(zzz,zz,inv1);
+    _ModMult(q1x,zz);_ModMult(q1y,zzz);
+
+    /* Normalize Q2 */
+    _ModMult(zz,inv2,inv2);_ModMult(zzz,zz,inv2);
+    _ModMult(q2x,zz);_ModMult(q2y,zzz);
+
+    /* Check Q1 (recid=0): SHA-256 + double hash */
+    int v=0, hash_choice=0, recid=0;
+    {
+        uint32_t *x32=(uint32_t*)q1x;
+        uint32_t pb[16];
+        pb[0]=__byte_perm(x32[7],0x2+(uint8_t)(q1y[0]&1),0x4321);
+        pb[1]=__byte_perm(x32[7],x32[6],0x0765);pb[2]=__byte_perm(x32[6],x32[5],0x0765);
+        pb[3]=__byte_perm(x32[5],x32[4],0x0765);pb[4]=__byte_perm(x32[4],x32[3],0x0765);
+        pb[5]=__byte_perm(x32[3],x32[2],0x0765);pb[6]=__byte_perm(x32[2],x32[1],0x0765);
+        pb[7]=__byte_perm(x32[1],x32[0],0x0765);pb[8]=__byte_perm(x32[0],0x80,0x0456);
+        pb[9]=0;pb[10]=0;pb[11]=0;pb[12]=0;pb[13]=0;pb[14]=0;pb[15]=0x108;
+        uint32_t hs[8]; _SHA256Initialize(hs); _SHA256Transform(hs,pb);
+        uint8_t h[32]; for(int i=0;i<8;i++){h[i*4]=(hs[i]>>24)&0xFF;h[i*4+1]=(hs[i]>>16)&0xFF;
+            h[i*4+2]=(hs[i]>>8)&0xFF;h[i*4+3]=hs[i]&0xFF;}
+        v=easy_mode?gpu_is_der_easy(h,32):gpu_is_valid_der(h,32);
+        if(!v){
+            uint8_t p2[64];memset(p2,0,64);memcpy(p2,h,32);p2[32]=0x80;p2[62]=1;p2[63]=0;
+            uint32_t b2[16];for(int i=0;i<16;i++)b2[i]=((uint32_t)p2[i*4]<<24)|((uint32_t)p2[i*4+1]<<16)|
+                ((uint32_t)p2[i*4+2]<<8)|(uint32_t)p2[i*4+3];
+            uint32_t h2s[8];_SHA256Initialize(h2s);_SHA256Transform(h2s,b2);
+            uint8_t h2[32];for(int i=0;i<8;i++){h2[i*4]=(h2s[i]>>24)&0xFF;h2[i*4+1]=(h2s[i]>>16)&0xFF;
+                h2[i*4+2]=(h2s[i]>>8)&0xFF;h2[i*4+3]=h2s[i]&0xFF;}
+            v=easy_mode?gpu_is_der_easy(h2,32):gpu_is_valid_der(h2,32);
+            hash_choice=1;
+        }
+    }
+
+    /* Check Q2 (recid=1) if Q1 missed */
+    if(!v){
+        hash_choice=0; recid=1;
+        uint32_t *x32=(uint32_t*)q2x;
+        uint32_t pb[16];
+        pb[0]=__byte_perm(x32[7],0x2+(uint8_t)(q2y[0]&1),0x4321);
+        pb[1]=__byte_perm(x32[7],x32[6],0x0765);pb[2]=__byte_perm(x32[6],x32[5],0x0765);
+        pb[3]=__byte_perm(x32[5],x32[4],0x0765);pb[4]=__byte_perm(x32[4],x32[3],0x0765);
+        pb[5]=__byte_perm(x32[3],x32[2],0x0765);pb[6]=__byte_perm(x32[2],x32[1],0x0765);
+        pb[7]=__byte_perm(x32[1],x32[0],0x0765);pb[8]=__byte_perm(x32[0],0x80,0x0456);
+        pb[9]=0;pb[10]=0;pb[11]=0;pb[12]=0;pb[13]=0;pb[14]=0;pb[15]=0x108;
+        uint32_t hs[8]; _SHA256Initialize(hs); _SHA256Transform(hs,pb);
+        uint8_t h[32]; for(int i=0;i<8;i++){h[i*4]=(hs[i]>>24)&0xFF;h[i*4+1]=(hs[i]>>16)&0xFF;
+            h[i*4+2]=(hs[i]>>8)&0xFF;h[i*4+3]=hs[i]&0xFF;}
+        v=easy_mode?gpu_is_der_easy(h,32):gpu_is_valid_der(h,32);
+        if(!v){
+            uint8_t p2[64];memset(p2,0,64);memcpy(p2,h,32);p2[32]=0x80;p2[62]=1;p2[63]=0;
+            uint32_t b2[16];for(int i=0;i<16;i++)b2[i]=((uint32_t)p2[i*4]<<24)|((uint32_t)p2[i*4+1]<<16)|
+                ((uint32_t)p2[i*4+2]<<8)|(uint32_t)p2[i*4+3];
+            uint32_t h2s[8];_SHA256Initialize(h2s);_SHA256Transform(h2s,b2);
+            uint8_t h2[32];for(int i=0;i<8;i++){h2[i*4]=(h2s[i]>>24)&0xFF;h2[i*4+1]=(h2s[i]>>16)&0xFF;
+                h2[i*4+2]=(h2s[i]>>8)&0xFF;h2[i*4+3]=h2s[i]&0xFF;}
+            v=easy_mode?gpu_is_der_easy(h2,32):gpu_is_valid_der(h2,32);
+            hash_choice=1;
+        }
+    }
+
+    /* Hit: encode idx(29:0) | recid(30) | hash_choice(31) */
+    if(v){uint32_t pos=atomicAdd(d_hit_cnt,1);
+        if(pos<1024)d_hit_idx[pos]=((uint32_t)idx)|(recid<<30)|(hash_choice<<31);}
 }
 
 /* ============================================================
@@ -449,12 +534,25 @@ int main(int argc, char **argv) {
     BN_bn2bin(ux,ux_be+(32-BN_num_bytes(ux))); BN_bn2bin(uy,uy_be+(32-BN_num_bytes(uy)));
     uint64_t h_u2rx[4],h_u2ry[4]; be_to_le64(h_u2rx,ux_be); be_to_le64(h_u2ry,uy_be);
     
+    /* neg_2u2R = -(2 * u2R) for second recovery flag */
+    EC_POINT *neg2u2R=EC_POINT_new(grp);
+    EC_POINT_dbl(grp, neg2u2R, u2R, bn_ctx);    /* 2*u2R */
+    EC_POINT_invert(grp, neg2u2R, bn_ctx);       /* negate */
+    BIGNUM *n2x=BN_new(),*n2y=BN_new();
+    EC_POINT_get_affine_coordinates_GFp(grp,neg2u2R,n2x,n2y,bn_ctx);
+    uint8_t n2x_be[32],n2y_be[32]; memset(n2x_be,0,32);memset(n2y_be,0,32);
+    BN_bn2bin(n2x,n2x_be+(32-BN_num_bytes(n2x))); BN_bn2bin(n2y,n2y_be+(32-BN_num_bytes(n2y)));
+    uint64_t h_neg2u2rx[4],h_neg2u2ry[4]; be_to_le64(h_neg2u2rx,n2x_be); be_to_le64(h_neg2u2ry,n2y_be);
+    
     /* Upload constants */
-    uint64_t *d_nri, *d_u2rx, *d_u2ry;
+    uint64_t *d_nri, *d_u2rx, *d_u2ry, *d_neg2u2rx, *d_neg2u2ry;
     cudaMalloc(&d_nri,32); cudaMalloc(&d_u2rx,32); cudaMalloc(&d_u2ry,32);
+    cudaMalloc(&d_neg2u2rx,32); cudaMalloc(&d_neg2u2ry,32);
     cudaMemcpy(d_nri,nri_le,32,cudaMemcpyHostToDevice);
     cudaMemcpy(d_u2rx,h_u2rx,32,cudaMemcpyHostToDevice);
     cudaMemcpy(d_u2ry,h_u2ry,32,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_neg2u2rx,h_neg2u2rx,32,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_neg2u2ry,h_neg2u2ry,32,cudaMemcpyHostToDevice);
     
     /* Build fake sighash preimage:
      * fixed_prefix (5000 bytes, covers scriptCode) → midstate
@@ -516,13 +614,13 @@ int main(int argc, char **argv) {
         uint32_t h_hit=0; cudaMemcpy(d_hit_cnt,&h_hit,4,cudaMemcpyHostToDevice);
         kernel_allgpu_pinning<<<GRDSZ,BLKSZ>>>(
             d_midstate, d_suffix, suffix_len, seq_offset, lt_offset, total_preimage_len, 0, 0,
-            d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+            d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
             d_hit_cnt, d_hit_idx, BATCH, 1);
         cudaDeviceSynchronize();
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(err)); return 1; }
         cudaMemcpy(&h_hit,d_hit_cnt,4,cudaMemcpyDeviceToHost);
-        printf("  Warmup: %u hits (1/16)\n", h_hit);
+        printf("  Warmup: %u hits (~1/8 double hash)\n", h_hit);
         
         /* Timed */
         h_hit=0; cudaMemcpy(d_hit_cnt,&h_hit,4,cudaMemcpyHostToDevice);
@@ -532,7 +630,7 @@ int main(int argc, char **argv) {
         for(int b=0;b<nb;b++){
             kernel_allgpu_pinning<<<GRDSZ,BLKSZ>>>(
                 d_midstate, d_suffix, suffix_len, seq_offset, lt_offset, total_preimage_len, 0, (uint32_t)(b*BATCH),
-                d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+                d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
                 d_hit_cnt, d_hit_idx, BATCH, 1);
             total += BATCH;
         }
@@ -546,12 +644,12 @@ int main(int argc, char **argv) {
         
         printf("  %d candidates in %.1f ms\n", total, ms);
         printf("  Rate: %.0f/s (%.1f μs each)\n", rate, ms*1000.0/total);
-        printf("  Hits (1/16): %u\n", h_hit);
+        printf("  Hits (~1/8 double hash): %u\n", h_hit);
         
-        double target=pow(2,46);
+        double target=pow(2,43.4);  /* 4 DER checks/cand: 2 recovery flags × 2 hashes = 2^-43.4 */
         double hours=target/rate/3600.0;
         double cost=0.089;
-        printf("\n  === EXTRAPOLATION (pinning, 2^46) ===\n");
+        printf("\n  === EXTRAPOLATION (pinning, 4 checks/cand, 2^43.4) ===\n");
         printf("  Rate: %.0f/s\n", rate);
         printf("  This machine: %.0f hours (%.1f days), $%.0f\n", hours, hours/24, hours*cost);
         for(int n=10;n<=100;n*=10)
@@ -587,7 +685,7 @@ int main(int argc, char **argv) {
                 kernel_allgpu_pinning<<<GRDSZ,BLKSZ>>>(
                     d_midstate, d_suffix, suffix_len, seq_offset, lt_offset,
                     total_preimage_len, seq, batch_lt,
-                    d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+                    d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
                     d_hit_cnt, d_hit_idx, BATCH, easy);
                 cudaDeviceSynchronize();
                 
@@ -607,9 +705,15 @@ int main(int argc, char **argv) {
                     FILE *f = fopen(fname, "w");
                     if (f) {
                         for (int h = 0; h < nh; h++) {
-                            uint32_t lt = batch_lt + hit_indices[h];
-                            fprintf(f, "sequence=%u\nlocktime=%u\n", seq, lt);
-                            printf("  sequence=%u locktime=%u\n", seq, lt);
+                            uint32_t raw = hit_indices[h];
+                            uint32_t lt = batch_lt + (raw & 0x3FFFFFFF);
+                            int ri = (raw >> 30) & 1;
+                            int hc = (raw >> 31) & 1;
+                            fprintf(f, "sequence=%u\nlocktime=%u\nhash_choice=%d\nrecid=%d\n", seq, lt, hc, ri);
+                            printf("  sequence=%u locktime=%u hash_choice=%d recid=%d (%s, %s)\n",
+                                   seq, lt, hc, ri,
+                                   hc ? "SHA256(SHA256)" : "SHA256",
+                                   ri ? "odd_y" : "even_y");
                         }
                         fclose(f);
                     }
@@ -635,10 +739,11 @@ int main(int argc, char **argv) {
     
     /* Cleanup */
     cudaFree(d_gtX);cudaFree(d_gtY);cudaFree(d_nri);cudaFree(d_u2rx);cudaFree(d_u2ry);
+    cudaFree(d_neg2u2rx);cudaFree(d_neg2u2ry);
     cudaFree(d_midstate);cudaFree(d_suffix);cudaFree(d_hit_cnt);cudaFree(d_hit_idx);
     free(fixed_prefix);free(suffix_template);
-    BN_free(bn_r);BN_free(bn_s);BN_free(bn_ri);BN_free(bn_u2);BN_free(ux);BN_free(uy);BN_free(bn_n);
-    EC_POINT_free(R_pt);EC_POINT_free(u2R);EC_GROUP_free(grp);BN_CTX_free(bn_ctx);
+    BN_free(bn_r);BN_free(bn_s);BN_free(bn_ri);BN_free(bn_u2);BN_free(ux);BN_free(uy);BN_free(n2x);BN_free(n2y);BN_free(bn_n);
+    EC_POINT_free(R_pt);EC_POINT_free(u2R);EC_POINT_free(neg2u2R);EC_GROUP_free(grp);BN_CTX_free(bn_ctx);
     EC_KEY_free(ec_key);ECDSA_SIG_free(sig);
     return 0;
 }
