@@ -40,7 +40,7 @@ from secp256k1 import (
     sha256d, ripemd160, hash160,
     compress_pubkey, decompress_pubkey, point_mul, point_add, G, N, P,
     ecdsa_sign, ecdsa_sign_with_k, ecdsa_recover, ecdsa_verify,
-    encode_der_sig, is_valid_der_sig, parse_der, modinv, int_to_der_int,
+    encode_der_sig, is_valid_der_sig, modinv, int_to_der_int,
 )
 from bitcoin_tx import (
     Transaction, TxIn, TxOut, QSBScriptBuilder,
@@ -538,6 +538,34 @@ def cmd_export(args):
 # Phase 4: Assemble transaction
 # ============================================================
 
+def parse_der(sig_bytes):
+    """Parse DER-encoded signature into (r, s) integers.
+    Handles optional sighash suffix byte.
+    Returns (None, None) if not valid DER."""
+    if len(sig_bytes) < 8:
+        return None, None
+    d = sig_bytes
+    try:
+        if d[0] != 0x30: return None, None
+        tl = d[1]
+        # Check if there's a sighash byte after DER
+        if tl + 2 == len(d) - 1:
+            d = d[:-1]  # strip sighash
+        idx = 2
+        if d[idx] != 0x02: return None, None
+        idx += 1
+        rl = d[idx]; idx += 1
+        r = int.from_bytes(d[idx:idx+rl], 'big')
+        idx += rl
+        if d[idx] != 0x02: return None, None
+        idx += 1
+        sl = d[idx]; idx += 1
+        s = int.from_bytes(d[idx:idx+sl], 'big')
+        return r, s
+    except (IndexError, ValueError):
+        return None, None
+
+
 def cmd_assemble(args):
     print("╔══════════════════════════════════════╗")
     print("║  QSB Pipeline — Phase 4: Assemble    ║")
@@ -626,8 +654,17 @@ def cmd_assemble(args):
         pt = ecdsa_recover(sp_r, sp_s, z_puzzle_pin, flag)
         if pt:
             key_puzzle_pin = compress_pubkey(pt)
-            print(f"    key_puzzle: {b2h(key_puzzle_pin)[:16]}... (flag={flag})")
+            print(f"    key_puzzle: {b2h(key_puzzle_pin)[:16]}... (flag={flag}, r as parsed)")
             break
+    if key_puzzle_pin is None:
+        from secp256k1 import N as _CURVE_N, P as _CURVE_P
+        if sp_r + _CURVE_N < _CURVE_P:
+            for flag in [0, 1]:
+                pt = ecdsa_recover(sp_r + _CURVE_N, sp_s, z_puzzle_pin, flag)
+                if pt:
+                    key_puzzle_pin = compress_pubkey(pt)
+                    print(f"    key_puzzle: {b2h(key_puzzle_pin)[:16]}... (flag={flag}, r+N)")
+                    break
     
     if key_puzzle_pin is None:
         print("    ERROR: could not recover pinning key_puzzle!")
@@ -682,12 +719,23 @@ def cmd_assemble(args):
         puzzle_sc2 = find_and_delete(full_script, sig_puzzle_round)
         z_puzzle_round = tx.sighash(QSB_INPUT_INDEX, puzzle_sc2, sighash_type=sp_ht)
         key_puzzle_round = None
+        # Try parsed r first
         for flag in [0, 1]:
             pt = ecdsa_recover(sp_r2, sp_s2, z_puzzle_round, flag)
             if pt:
                 key_puzzle_round = compress_pubkey(pt)
-                print(f"    key_puzzle: {b2h(key_puzzle_round)[:16]}... (flag={flag})")
+                print(f"    key_puzzle: {b2h(key_puzzle_round)[:16]}... (flag={flag}, r as parsed)")
                 break
+        # If r isn't on curve, try r+N as fallback
+        if key_puzzle_round is None:
+            from secp256k1 import N as _CURVE_N, P as _CURVE_P
+            if sp_r2 + _CURVE_N < _CURVE_P:
+                for flag in [0, 1]:
+                    pt = ecdsa_recover(sp_r2 + _CURVE_N, sp_s2, z_puzzle_round, flag)
+                    if pt:
+                        key_puzzle_round = compress_pubkey(pt)
+                        print(f"    key_puzzle: {b2h(key_puzzle_round)[:16]}... (flag={flag}, r+N)")
+                        break
         if key_puzzle_round is None:
             print(f"    ERROR: round {ri+1} key_puzzle recovery failed!")
             return
@@ -700,11 +748,24 @@ def cmd_assemble(args):
             if dr is None:
                 print(f"    ERROR: dummy sig {idx} not valid DER!")
                 return
+            recovered = None
             for flag in [0, 1]:
                 pt = ecdsa_recover(dr, ds_val, 1, flag)
                 if pt:
-                    dummy_pubkeys.append(compress_pubkey(pt))
+                    recovered = compress_pubkey(pt)
                     break
+            if recovered is None:
+                from secp256k1 import N as _CURVE_N, P as _CURVE_P
+                if dr + _CURVE_N < _CURVE_P:
+                    for flag in [0, 1]:
+                        pt = ecdsa_recover(dr + _CURVE_N, ds_val, 1, flag)
+                        if pt:
+                            recovered = compress_pubkey(pt)
+                            break
+            if recovered is None:
+                print(f"    ERROR: failed to recover dummy pubkey for idx {idx}!")
+                return
+            dummy_pubkeys.append(recovered)
         
         signed_indices = indices[:ts]
         preimages = [h2b(state['hors_secrets'][ri][i]) for i in signed_indices]

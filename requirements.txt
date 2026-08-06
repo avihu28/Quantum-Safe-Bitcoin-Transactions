@@ -1,0 +1,14 @@
+# Orchestration (v16/qsb_orchestrator_v16.py) — renting and driving GPU hosts.
+vastai
+requests
+paramiko
+
+# Optional fast paths. The pipeline falls back to the pure-Python secp256k1
+# in pipeline/secp256k1.py when these are absent, so verification works
+# without them — they are only needed for speed and for address encoding.
+coincurve
+base58
+
+# Optional: consensus-level script checks in config_a/verify/.
+# The Rust verifier in verifier/ covers the same ground via libbitcoinconsensus.
+python-bitcoinlib

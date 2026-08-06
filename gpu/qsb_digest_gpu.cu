@@ -7,7 +7,7 @@
  *   2. SHA-256d from precomputed midstate (~27 blocks)
  *   3. Scalar mul: u1 = neg_r_inv * z mod N
  *   4. EC: Q = u1*G + u2R
- *   5. Hash160(compress(Q))
+ *   5. SHA256(compress(Q)) + double hash DER
  *   6. DER check
  *
  * Build:
@@ -186,7 +186,7 @@ __device__ void gpu_scalar_mulmod(uint64_t r[4], const uint64_t a[4], const uint
  *   - Loads its 9-byte combo (indices to skip)
  *   - Builds suffix: loop over 150 dummy sigs, skip selected, append tail + tx_suffix
  *   - SHA-256d from midstate
- *   - Scalar mul + EC recovery + Hash160 + DER check
+ *   - Scalar mul + EC recovery + SHA256 double hash + DER check
  * ============================================================ */
 
 #define N_POOL 150
@@ -204,6 +204,7 @@ __global__ void kernel_digest_allgpu(
     int total_preimage_len,        /* total sighash preimage length for SHA-256 padding */
     const uint64_t *d_neg_r_inv,
     const uint64_t *d_u2rx, const uint64_t *d_u2ry,
+    const uint64_t *d_neg2u2rx, const uint64_t *d_neg2u2ry,
     uint8_t *d_gtX, uint8_t *d_gtY,
     uint32_t *d_hit_cnt, uint32_t *d_hit_idx,
     int batch_size, int easy_mode
@@ -261,22 +262,66 @@ __global__ void kernel_digest_allgpu(
     uint64_t qx[4], qy[4];
     _PointMultiSecp256k1(qx, qy, pk, d_gtX, d_gtY);
 
+    /* Q1 = u1*G + u2*R (recid=0) */
     uint64_t u2rx[4]={d_u2rx[0],d_u2rx[1],d_u2rx[2],d_u2rx[3]};
     uint64_t u2ry[4]={d_u2ry[0],d_u2ry[1],d_u2ry[2],d_u2ry[3]};
-    uint64_t qz[5]={1,0,0,0,0};
-    _PointAddSecp256k1(qx,qy,qz,u2rx,u2ry);
-    _ModInv(qz);
+    uint64_t q1x[4],q1y[4],q1z[5];
+    memcpy(q1x,qx,32);memcpy(q1y,qy,32);
+    q1z[0]=1;q1z[1]=0;q1z[2]=0;q1z[3]=0;q1z[4]=0;
+    _PointAddSecp256k1(q1x,q1y,q1z,u2rx,u2ry);
+
+    /* Q2 = Q1 + neg_2u2R (recid=1) */
+    uint64_t q2x[4],q2y[4],q2z[5];
+    memcpy(q2x,q1x,32);memcpy(q2y,q1y,32);memcpy(q2z,q1z,40);
+    uint64_t n2rx[4]={d_neg2u2rx[0],d_neg2u2rx[1],d_neg2u2rx[2],d_neg2u2rx[3]};
+    uint64_t n2ry[4]={d_neg2u2ry[0],d_neg2u2ry[1],d_neg2u2ry[2],d_neg2u2ry[3]};
+    _PointAddSecp256k1(q2x,q2y,q2z,n2rx,n2ry);
+
+    /* Batch ModInv */
+    uint64_t prod[5];
+    _ModMult(prod,q1z,q2z);_ModInv(prod);
+    uint64_t inv1[5],inv2[5];
+    _ModMult(inv1,prod,q2z);_ModMult(inv2,prod,q1z);
+
+    /* Normalize Q1 */
     uint64_t zz[4],zzz[4];
-    _ModMult(zz,qz,qz);_ModMult(zzz,zz,qz);
-    _ModMult(qx,zz);_ModMult(qy,zzz);
+    _ModMult(zz,inv1,inv1);_ModMult(zzz,zz,inv1);
+    _ModMult(q1x,zz);_ModMult(q1y,zzz);
 
-    uint8_t h160[20];
-    _GetHash160Comp(qx,(uint8_t)(qy[0]&1),h160);
+    /* Normalize Q2 */
+    _ModMult(zz,inv2,inv2);_ModMult(zzz,zz,inv2);
+    _ModMult(q2x,zz);_ModMult(q2y,zzz);
 
-    int v = easy_mode ? gpu_is_der_easy(h160,20) : gpu_is_valid_der(h160,20);
+    /* Check both pubkeys × 2 hashes */
+    int v=0, hash_choice=0, recid=0;
+    uint64_t *pts_x[2]={q1x,q2x};
+    uint64_t *pts_y[2]={q1y,q2y};
+    for(int ri=0;ri<2&&!v;ri++){
+        uint32_t *x32=(uint32_t*)pts_x[ri];
+        uint32_t pb[16];
+        pb[0]=__byte_perm(x32[7],0x2+(uint8_t)(pts_y[ri][0]&1),0x4321);
+        pb[1]=__byte_perm(x32[7],x32[6],0x0765);pb[2]=__byte_perm(x32[6],x32[5],0x0765);
+        pb[3]=__byte_perm(x32[5],x32[4],0x0765);pb[4]=__byte_perm(x32[4],x32[3],0x0765);
+        pb[5]=__byte_perm(x32[3],x32[2],0x0765);pb[6]=__byte_perm(x32[2],x32[1],0x0765);
+        pb[7]=__byte_perm(x32[1],x32[0],0x0765);pb[8]=__byte_perm(x32[0],0x80,0x0456);
+        pb[9]=0;pb[10]=0;pb[11]=0;pb[12]=0;pb[13]=0;pb[14]=0;pb[15]=0x108;
+        uint32_t hs[8];_SHA256Initialize(hs);_SHA256Transform(hs,pb);
+        uint8_t h[32];for(int i=0;i<8;i++){h[i*4]=(hs[i]>>24)&0xFF;h[i*4+1]=(hs[i]>>16)&0xFF;
+            h[i*4+2]=(hs[i]>>8)&0xFF;h[i*4+3]=hs[i]&0xFF;}
+        v=easy_mode?gpu_is_der_easy(h,32):gpu_is_valid_der(h,32);
+        if(v){hash_choice=0;recid=ri;break;}
+        uint8_t p2[64];memset(p2,0,64);memcpy(p2,h,32);p2[32]=0x80;p2[62]=1;p2[63]=0;
+        uint32_t b2[16];for(int i=0;i<16;i++)b2[i]=((uint32_t)p2[i*4]<<24)|((uint32_t)p2[i*4+1]<<16)|
+            ((uint32_t)p2[i*4+2]<<8)|(uint32_t)p2[i*4+3];
+        uint32_t h2s[8];_SHA256Initialize(h2s);_SHA256Transform(h2s,b2);
+        uint8_t h2[32];for(int i=0;i<8;i++){h2[i*4]=(h2s[i]>>24)&0xFF;h2[i*4+1]=(h2s[i]>>16)&0xFF;
+            h2[i*4+2]=(h2s[i]>>8)&0xFF;h2[i*4+3]=h2s[i]&0xFF;}
+        v=easy_mode?gpu_is_der_easy(h2,32):gpu_is_valid_der(h2,32);
+        if(v){hash_choice=1;recid=ri;break;}
+    }
     if (v) {
         uint32_t p = atomicAdd(d_hit_cnt, 1);
-        if (p < 4096) d_hit_idx[p] = (uint32_t)idx;
+        if (p < 4096) d_hit_idx[p] = ((uint32_t)idx) | (recid<<30) | (hash_choice << 31);
     }
 }
 
@@ -406,11 +451,24 @@ int main(int argc, char **argv) {
     BN_bn2bin(ux,uxb+(32-BN_num_bytes(ux)));BN_bn2bin(uy,uyb+(32-BN_num_bytes(uy)));
     uint64_t hu2rx[4],hu2ry[4]; be_to_le64(hu2rx,uxb);be_to_le64(hu2ry,uyb);
 
-    uint64_t *d_nri,*d_u2rx,*d_u2ry;
+    /* Compute neg_2u2R */
+    EC_POINT *neg2u2R=EC_POINT_new(grp);
+    EC_POINT_dbl(grp,neg2u2R,u2R,bn_ctx);
+    EC_POINT_invert(grp,neg2u2R,bn_ctx);
+    BIGNUM *n2x=BN_new(),*n2y=BN_new();
+    EC_POINT_get_affine_coordinates_GFp(grp,neg2u2R,n2x,n2y,bn_ctx);
+    uint8_t n2xb[32],n2yb[32]; memset(n2xb,0,32);memset(n2yb,0,32);
+    BN_bn2bin(n2x,n2xb+(32-BN_num_bytes(n2x)));BN_bn2bin(n2y,n2yb+(32-BN_num_bytes(n2y)));
+    uint64_t hn2rx[4],hn2ry[4]; be_to_le64(hn2rx,n2xb);be_to_le64(hn2ry,n2yb);
+
+    uint64_t *d_nri,*d_u2rx,*d_u2ry,*d_neg2u2rx,*d_neg2u2ry;
     cudaMalloc(&d_nri,32);cudaMalloc(&d_u2rx,32);cudaMalloc(&d_u2ry,32);
+    cudaMalloc(&d_neg2u2rx,32);cudaMalloc(&d_neg2u2ry,32);
     cudaMemcpy(d_nri,nri,32,cudaMemcpyHostToDevice);
     cudaMemcpy(d_u2rx,hu2rx,32,cudaMemcpyHostToDevice);
     cudaMemcpy(d_u2ry,hu2ry,32,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_neg2u2rx,hn2rx,32,cudaMemcpyHostToDevice);
+    cudaMemcpy(d_neg2u2ry,hn2ry,32,cudaMemcpyHostToDevice);
 
     /* Build fake script data */
     int hors_len = 150 * 21;
@@ -532,7 +590,7 @@ int main(int argc, char **argv) {
         kernel_digest_allgpu<<<GRDSZ,BLKSZ>>>(
             d_combos, d_midstate, d_dummy_sigs, d_tail, tail_len,
             d_tx_suffix, tx_suffix_len, total_preimage_len,
-            d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+            d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
             d_hit_cnt, d_hit_idx, BATCH, 1);
         cudaDeviceSynchronize();
         cudaError_t err=cudaGetLastError();
@@ -549,7 +607,7 @@ int main(int argc, char **argv) {
             kernel_digest_allgpu<<<GRDSZ,BLKSZ>>>(
                 d_combos, d_midstate, d_dummy_sigs, d_tail, tail_len,
                 d_tx_suffix, tx_suffix_len, total_preimage_len,
-                d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+                d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
                 d_hit_cnt, d_hit_idx, BATCH, 1);
             total+=BATCH;
         }
@@ -640,7 +698,7 @@ int main(int argc, char **argv) {
                 kernel_digest_allgpu<<<grdsz,BLKSZ>>>(
                     d_combos, d_midstate, d_dummy_sigs, d_tail, tail_len,
                     d_tx_suffix, tx_suffix_len, total_preimage_len,
-                    d_nri, d_u2rx, d_u2ry, d_gtX, d_gtY,
+                    d_nri, d_u2rx, d_u2ry, d_neg2u2rx, d_neg2u2ry, d_gtX, d_gtY,
                     d_hit_cnt, d_hit_idx, batch_pos, easy_mode);
                 cudaDeviceSynchronize();
                 
@@ -693,7 +751,7 @@ int main(int argc, char **argv) {
 
     /* Cleanup */
     free(hors_section);free(tail);free(tx_prefix);free(tx_suffix);free(fixed_prefix);
-    cudaFree(d_gtX);cudaFree(d_gtY);cudaFree(d_nri);cudaFree(d_u2rx);cudaFree(d_u2ry);
+    cudaFree(d_gtX);cudaFree(d_gtY);cudaFree(d_nri);cudaFree(d_u2rx);cudaFree(d_u2ry);cudaFree(d_neg2u2rx);cudaFree(d_neg2u2ry);
     cudaFree(d_midstate);cudaFree(d_dummy_sigs);cudaFree(d_tail);cudaFree(d_tx_suffix);
     if(d_hors_rem) cudaFree(d_hors_rem);
     cudaFree(d_hit_cnt);cudaFree(d_hit_idx);
