@@ -115,7 +115,9 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 │   ├── secp256k1_fast.py    # Fast EC math using coincurve
 │   ├── benchmark.py         # Benchmarking and graduated tests
 │   ├── qsb_run.py          # vast.ai fleet orchestration (multi-machine)
-│   └── run_qsb.sh          # All-in-one run script for vast.ai
+│   ├── run_qsb.sh          # All-in-one run script for vast.ai
+│   ├── test_consensus_cpu.py     # Pure-Python consensus gate (real ECDSA)
+│   └── test_bitcoinconsensus.py  # Gold-standard gate via libbitcoinconsensus
 ├── script/                  # Full generated Bitcoin Scripts
 ├── v16/                     # Current orchestrator — start here to run a search
 │   ├── qsb_orchestrator_v16.py  # Rents hosts, uploads bundle, drives the search
