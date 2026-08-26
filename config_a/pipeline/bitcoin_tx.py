@@ -161,8 +161,13 @@ class Transaction:
             pass  # no outputs
         elif base == 0x03:  # SIGHASH_SINGLE
             if input_index >= len(self.outputs):
-                # SIGHASH_SINGLE bug: return 1
-                return 1
+                # SIGHASH_SINGLE bug. Bitcoin Core returns uint256::ONE, whose
+                # raw little-endian bytes (01 00 .. 00) are fed to secp256k1's
+                # msg32 and read BIG-ENDIAN — i.e. the message scalar is 2**248,
+                # NOT the integer 1. Using 1 here makes every dummy pubkey be
+                # recovered against the wrong message and fail under real Bitcoin
+                # Core consensus (confirmed via libbitcoinconsensus).
+                return 1 << 248
             for i in range(input_index + 1):
                 if i < input_index:
                     tx_copy.add_output(TxOut(-1, b''))
@@ -331,6 +336,51 @@ def _encode_9byte_sig(r, s, sighash=0x03):
 
 
 # ============================================================
+# Stack model — computes OP_ROLL positions from the ACTUAL modeled stack
+# instead of hand-derived formulas. The original build_round_script formulas
+# were off by one (they omitted the OP_0 CHECKMULTISIG dummy and used a fixed
+# commitment gap n+1 that must actually shrink to n+1-i per iteration) and did
+# not account for cross-round drift (round 2 sits one item higher than round 1
+# because round 1 leaves a CHECKMULTISIG result on the stack). Threading this
+# model through the whole script makes every position correct by construction.
+# ============================================================
+
+class _StackModel:
+    """Models the script stack (index -1 = top). Tokens are opaque labels."""
+    def __init__(self):
+        self.s = []                       # bottom .. top
+
+    def push(self, tok):
+        self.s.append(tok)
+
+    def depth(self, tok):
+        """0 = top."""
+        for k in range(len(self.s) - 1, -1, -1):
+            if self.s[k] == tok:
+                return len(self.s) - 1 - k
+        raise KeyError(tok)
+
+    def deepest_dummy(self, rnd):
+        """Depth of the deepest remaining dummy of round `rnd` (for OP_MIN sanitize)."""
+        best = -1
+        for k in range(len(self.s)):
+            t = self.s[k]
+            if isinstance(t, tuple) and len(t) == 3 and t[0] == 'D' and t[1] == rnd:
+                best = max(best, len(self.s) - 1 - k)
+        return best
+
+    def roll(self, d):
+        """OP_ROLL semantics (the count has already been popped): move the item
+        at depth d to the top."""
+        i = len(self.s) - 1 - d
+        self.s.append(self.s.pop(i))
+
+    def pop(self, k=1):
+        for _ in range(k):
+            self.s.pop()
+
+
+# ============================================================
 # QSB Script Builder
 # ============================================================
 
@@ -465,8 +515,130 @@ class QSBScriptBuilder:
             script += bytes([OP_CHECKSIGVERIFY]) # 5: verify (sig_puzzle, key_puzzle)
         return script
 
+    # ---- round parameter helpers (corrected stack-model path) ----
+    def _round_t(self, round_idx):
+        t_signed = self.t1_signed if round_idx == 0 else self.t2_signed
+        t_bonus = self.t1_bonus if round_idx == 0 else self.t2_bonus
+        return t_signed, t_bonus, t_signed + t_bonus
+
+    def _canonical_subset(self, round_idx):
+        """Any valid t_total distinct pool indices; used to build the
+        (subset-independent) locking script."""
+        _, _, t_total = self._round_t(round_idx)
+        return list(range(t_total))
+
+    def _seed_witness(self, m, round_idx):
+        """Push this round's witness tokens (bottom..top): kp, kn, pubs, pres, idxs.
+        Matches cmd_assemble's witness order."""
+        t_signed, _, t_total = self._round_t(round_idx)
+        R = round_idx
+        m.push(('kp', R)); m.push(('kn', R))
+        for j in range(t_total - 1, -1, -1): m.push(('pub', R, j))
+        for j in range(t_signed - 1, -1, -1): m.push(('pre', R, j))
+        for j in range(t_total - 1, -1, -1): m.push(('idx', R, j))
+
+    def _model_pinning(self, m):
+        """Model the pinning stage's net stack effect: it consumes key_puzzle and
+        key_nonce (the pinning witness) and leaves nothing."""
+        m.pop(2)
+
+    def _emit_round(self, m, round_idx, sig_nonce_bytes, subset):
+        """Emit one round's script bytes for a SINGLE-HASH puzzle (ripemd160 or
+        sha256), computing every OP_ROLL position from the live stack model `m`
+        (which must already hold this round's witness block and everything below
+        it). Returns (script_bytes, idxvals) where idxvals are the per-selection
+        witness index numbers for `subset`."""
+        if self.hash_mode not in ('ripemd160', 'sha256'):
+            raise ValueError("_emit_round supports single-hash modes only; "
+                             "hash_mode=%r uses the legacy path" % self.hash_mode)
+        hashop = OP_RIPEMD160_OP if self.hash_mode == 'ripemd160' else OP_SHA256_OP
+        n = self.n
+        R = round_idx
+        t_signed, t_bonus, t_total = self._round_t(round_idx)
+        out = bytearray()
+        # --- round data pushes ---
+        for p in range(n - 1, -1, -1):
+            out += push_data(self.hors_commitments[R][p]); m.push(('C', R, p))
+        for p in range(n - 1, -1, -1):
+            out += push_data(self.dummy_sigs[R][p]); m.push(('D', R, p))
+        out += bytes([OP_0]); m.push(('zero', R))
+        out += push_data(sig_nonce_bytes); m.push(('signonce', R))
+        idxvals = []
+        # --- signed selections (9 opcodes each) ---
+        for i in range(t_signed):
+            tgt = subset[i]
+            A = m.depth(('idx', R, i)); m.roll(A); m.pop(1); m.push(('iv', R, i))
+            san = m.deepest_dummy(R)
+            m.push(('iv', R, i))                                  # OP_DUP
+            m.pop(1); dc = m.depth(('C', R, tgt)); m.roll(dc)     # OP_ADD + OP_ROLL (commitment)
+            D = m.depth(('pre', R, i)); m.roll(D)                 # preimage fetch
+            m.pop(2)                                              # OP_HASH160 + OP_EQUALVERIFY
+            m.pop(1); dd = m.depth(('D', R, tgt)); m.roll(dd)     # OP_ROLL (dummy)
+            gap = dc - dd; idxvals.append(dd)
+            out += push_number(A) + bytes([OP_ROLL])
+            out += push_number(san) + bytes([OP_MIN])
+            out += bytes([OP_DUP])
+            out += push_number(gap) + bytes([OP_ADD, OP_ROLL])
+            out += push_number(D) + bytes([OP_ROLL])
+            out += bytes([OP_HASH160, OP_EQUALVERIFY, OP_ROLL])
+        # --- bonus selections (3 opcodes each) ---
+        for bi in range(t_bonus):
+            j = t_signed + bi; tgt = subset[j]
+            A = m.depth(('idx', R, j)); m.roll(A); m.pop(1); m.push(('iv', R, j))
+            san = m.deepest_dummy(R)
+            m.pop(1); dd = m.depth(('D', R, tgt)); m.roll(dd); idxvals.append(dd)
+            out += push_number(A) + bytes([OP_ROLL])
+            out += push_number(san) + bytes([OP_MIN])
+            out += bytes([OP_ROLL])
+        # --- puzzle: ROLL key_nonce, DUP, HASH, ROLL key_puzzle, CHECKSIGVERIFY ---
+        pk = m.depth(('kn', R)); m.roll(pk); m.push(('kn', R)); m.pop(1); m.push(('sp', R))
+        pp = m.depth(('kp', R)); m.roll(pp); m.pop(2)
+        out += push_number(pk) + bytes([OP_ROLL, OP_DUP, hashop])
+        out += push_number(pp) + bytes([OP_ROLL, OP_CHECKSIGVERIFY])
+        # --- CHECKMULTISIG (t+1)-of-(t+1): pubkeys = t_total dummy pubs + key_nonce,
+        #     rolled so their order matches the gathered dummy-sig order. ---
+        mval = t_total + 1
+        out += push_number(mval); m.push(('M', R))
+        for tok in [('kn', R)] + [('pub', R, j) for j in range(t_total)]:
+            d = m.depth(tok); m.roll(d); out += push_number(d) + bytes([OP_ROLL])
+        out += push_number(mval); m.push(('N', R))
+        out += bytes([OP_CHECKMULTISIG])
+        # CHECKMULTISIG pops: N-value + N pubkeys + M-value + M sigs + dummy
+        m.pop(2 * (t_total + 1) + 3); m.push(('cms', R))
+        return bytes(out), idxvals
+
+    def compute_witness_indices(self, subsets):
+        """Given the chosen subsets {0:[...], 1:[...]}, return the model-derived
+        witness index numbers {0:[...], 1:[...]} the corrected selection loop
+        expects. Replays the same model build_full_script uses. Single-hash only."""
+        m = _StackModel()
+        self._seed_witness(m, 1)
+        self._seed_witness(m, 0)
+        m.push(('pin_kp',)); m.push(('pin_kn',))
+        self._model_pinning(m)
+        _, iv0 = self._emit_round(m, 0, b'\x30\x06\x02\x01\x01\x02\x01\x01\x01', subsets[0])
+        _, iv1 = self._emit_round(m, 1, b'\x30\x06\x02\x01\x01\x02\x01\x01\x01', subsets[1])
+        return {0: iv0, 1: iv1}
+
     def build_round_script(self, round_idx, sig_nonce_bytes):
-        """Build a single round's script"""
+        """Build a single round's script. Single-hash modes use the corrected
+        stack model IN ISOLATION (fresh stack); sha256_double uses the legacy
+        path. For a consensus-valid two-round lock use build_full_script, which
+        threads a shared model so round 2's positions account for round 1."""
+        if self.hash_mode in ('ripemd160', 'sha256'):
+            m = _StackModel()
+            self._seed_witness(m, round_idx)
+            script, _ = self._emit_round(m, round_idx, sig_nonce_bytes,
+                                         self._canonical_subset(round_idx))
+            return script
+        return self._build_round_script_legacy(round_idx, sig_nonce_bytes)
+
+    def _build_round_script_legacy(self, round_idx, sig_nonce_bytes):
+        """LEGACY hand-formula round builder. Retained ONLY for hash_mode
+        'sha256_double' (Config D), which is over-budget/deprecated and NOT
+        consensus-corrected — its selection positions still carry the original
+        off-by-one. Single-hash modes go through the corrected stack model
+        (_emit_round). Kept so verify_script_budget can still size Config D."""
         t_signed = self.t1_signed if round_idx == 0 else self.t2_signed
         t_bonus = self.t1_bonus if round_idx == 0 else self.t2_bonus
         t_total = t_signed + t_bonus
@@ -575,7 +747,21 @@ class QSBScriptBuilder:
         return script
     
     def build_full_script(self, pin_sig, round1_sig, round2_sig):
-        """Build the complete locking script"""
+        """Build the complete locking script. Single-hash modes thread a shared
+        stack model so round 2's OP_ROLL positions account for round 1's leftover
+        CHECKMULTISIG result (the cross-round drift the legacy path missed)."""
+        if self.hash_mode in ('ripemd160', 'sha256'):
+            m = _StackModel()
+            # full witness (bottom..top): round-2 block, round-1 block, pin kp, kn
+            self._seed_witness(m, 1)
+            self._seed_witness(m, 0)
+            m.push(('pin_kp',)); m.push(('pin_kn',))
+            script = bytearray(self.build_pinning_script(pin_sig))
+            self._model_pinning(m)
+            s0, _ = self._emit_round(m, 0, round1_sig, self._canonical_subset(0))
+            s1, _ = self._emit_round(m, 1, round2_sig, self._canonical_subset(1))
+            return bytes(script) + s0 + s1
+        # sha256_double: legacy concatenation (not consensus-corrected)
         script = self.build_pinning_script(pin_sig)
         script += self.build_round_script(0, round1_sig)
         script += self.build_round_script(1, round2_sig)
