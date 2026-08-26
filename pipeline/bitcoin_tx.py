@@ -457,6 +457,10 @@ class QSBScriptBuilder:
         the live stack model `m` (which must already hold this round's witness
         block and everything below it). Returns (script_bytes, idxvals) where
         idxvals are the per-selection witness index numbers for `subset`."""
+        if self.hash_mode not in ('ripemd160', 'sha256'):
+            raise ValueError("_emit_round supports single-hash modes only; "
+                             "hash_mode=%r is not consensus-corrected" % self.hash_mode)
+        hashop = OP_RIPEMD160_OP if self.hash_mode == 'ripemd160' else OP_SHA256_OP
         n = self.n
         R = round_idx
         t_signed, t_bonus, t_total = self._round_t(round_idx)
@@ -495,10 +499,10 @@ class QSBScriptBuilder:
             out += push_number(A) + bytes([OP_ROLL])
             out += push_number(san) + bytes([OP_MIN])
             out += bytes([OP_ROLL])
-        # --- puzzle: ROLL key_nonce, DUP, RIPEMD160, ROLL key_puzzle, CHECKSIGVERIFY ---
+        # --- puzzle: ROLL key_nonce, DUP, <hashop>, ROLL key_puzzle, CHECKSIGVERIFY ---
         pk = m.depth(('kn', R)); m.roll(pk); m.push(('kn', R)); m.pop(1); m.push(('sp', R))
         pp = m.depth(('kp', R)); m.roll(pp); m.pop(2)
-        out += push_number(pk) + bytes([OP_ROLL, OP_DUP, OP_RIPEMD160_OP])
+        out += push_number(pk) + bytes([OP_ROLL, OP_DUP, hashop])
         out += push_number(pp) + bytes([OP_ROLL, OP_CHECKSIGVERIFY])
         # --- CHECKMULTISIG (t+1)-of-(t+1): pubkeys = t_total dummy pubs + key_nonce,
         #     rolled so their order matches the gathered dummy-sig order. ---
