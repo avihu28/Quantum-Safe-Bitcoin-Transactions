@@ -588,7 +588,15 @@ def cmd_assemble(args):
     assert len(r2_indices) == t2, f"Expected {t2} round2 indices, got {len(r2_indices)}"
     
     full_script = h2b(state['full_script_hex'])
-    
+
+    # Corrected witness index encoding: the selection loop reads model-derived
+    # dummy-depths, not raw pool indices. Rebuild a builder holding the pool data
+    # and compute the indices exactly as build_full_script positioned them.
+    _wb = QSBScriptBuilder(n, state['t1s'], state['t1b'], state['t2s'], state['t2b'])
+    _wb.hors_commitments = [[h2b(c) for c in state['hors_commitments'][r]] for r in range(2)]
+    _wb.dummy_sigs = [[h2b(s) for s in state['dummy_sigs'][r]] for r in range(2)]
+    witness_indices = _wb.compute_witness_indices({0: r1_indices, 1: r2_indices})
+
     print(f"  Locktime: {locktime}")
     print(f"  Sequence: {sequence} (0x{sequence:08X})")
     print(f"  Round 1 indices: {r1_indices}")
@@ -719,8 +727,12 @@ def cmd_assemble(args):
         if key_puzzle_round is None:
             print(f"    ERROR: round {ri+1} key_puzzle recovery failed!")
             return
-        
-        # Recover dummy pubkeys (z=1)
+
+        # Recover dummy pubkeys via the SIGHASH_SINGLE bug. Bitcoin Core's bug
+        # value is 2**248 (uint256::ONE's little-endian bytes read big-endian by
+        # secp256k1), NOT the integer 1 — must match or the dummies fail consensus.
+        # This requires QSB_INPUT_INDEX >= num_outputs
+        SIGHASH_SINGLE_BUG_Z = 1 << 248
         dummy_pubkeys = []
         for idx in indices:
             ds_bytes = h2b(state['dummy_sigs'][ri][idx])
@@ -729,7 +741,7 @@ def cmd_assemble(args):
                 print(f"    ERROR: dummy sig {idx} not valid DER!")
                 return
             for flag in [0, 1]:
-                pt = ecdsa_recover(dr, ds_val, 1, flag)
+                pt = ecdsa_recover(dr, ds_val, SIGHASH_SINGLE_BUG_Z, flag)
                 if pt:
                     dummy_pubkeys.append(compress_pubkey(pt))
                     break
@@ -761,8 +773,11 @@ def cmd_assemble(args):
             witness += push_data(pub)
         for pre in reversed(rr['preimages']):
             witness += push_data(pre)
-        for idx in reversed(rr['subset']):
-            witness += push_number(idx)
+        # model-derived index numbers (NOT raw pool indices); pushed so that
+        # selection 0's index ends on top, matching _seed_witness order.
+        ivs = witness_indices[rd]
+        for j in range(len(ivs) - 1, -1, -1):
+            witness += push_number(ivs[j])
     
     witness += push_data(key_puzzle_pin)
     witness += push_data(key_nonce_pin)
