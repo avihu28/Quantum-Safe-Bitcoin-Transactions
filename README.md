@@ -108,7 +108,7 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 │   ├── Makefile
 │   ├── launch_multi_gpu.sh  # Multi-GPU launcher
 │   └── run_pinning.sh       # Per-machine pinning search
-├── pipeline/                # Python pipeline and orchestration
+├── pipeline/                # Python pipeline — AUTHORITATIVE (consensus-corrected)
 │   ├── qsb_pipeline.py     # Full pipeline: setup → export → search → assemble
 │   ├── bitcoin_tx.py        # Transaction construction, sighash, FindAndDelete
 │   ├── secp256k1.py         # EC math, ECDSA sign/recover, DER encode/parse
@@ -118,17 +118,17 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 │   ├── run_qsb.sh          # All-in-one run script for vast.ai
 │   ├── test_consensus_cpu.py     # Pure-Python consensus gate (real ECDSA)
 │   └── test_bitcoinconsensus.py  # Gold-standard gate via libbitcoinconsensus
-├── script/                  # Full generated Bitcoin Scripts
+├── script/                  # Generated Scripts — STALE (pre-dates the OP_ROLL fix)
 ├── v16/                     # Current orchestrator — start here to run a search
 │   ├── qsb_orchestrator_v16.py  # Rents hosts, uploads bundle, drives the search
 │   ├── bundle/              # v16 CUDA kernels + search inputs (authoritative)
 │   ├── make_bundle.sh       # Packs bundle/ into the uploaded qsb_v16.zip
-│   ├── pipeline/            # Tx assembly and local verification
-│   ├── results/             # Pre-computed pinning + R1 hit
+│   ├── pipeline/            # STALE COPY — still carries the off-by-one (see below)
+│   ├── results/             # Hits found against the pre-fix script — STALE
 │   └── verify_r2_hit.py     # CPU re-derivation of a GPU hit
-├── config_a/                # Config A working tree: runbooks, regtest, verify/
+├── config_a/                # Config A tree: runbooks, regtest, verify/ (pipeline corrected)
 ├── verifier/                # Rust consensus verifier (libbitcoinconsensus)
-├── transactions/            # Funding and spending transactions (hex)
+├── transactions/            # Funding/spending txs (hex) — STALE (built pre-fix)
 ├── requirements.txt
 └── README.md
 ```
@@ -139,6 +139,42 @@ These constraints force careful parameter tuning. The "bonus key" optimization a
 carry the `gpu_scalar_mulmod` carry-propagation fix that eliminated the R2 false
 positives — see [`v16/README.md`](v16/README.md). The copies under `gpu/` and
 `config_a/gpu/` predate that fix and are kept for reference.
+
+### Which Python pipeline is current?
+
+There are three copies of the Python transaction-building code. They are **not**
+identical, and only the first is safe to build a real lock with:
+
+| Tree | Status |
+|------|--------|
+| `pipeline/` | **Authoritative.** Model-derived `OP_ROLL` positions, `hash_mode`-aware puzzle, SIGHASH_SINGLE bug value `2**248`. |
+| `config_a/pipeline/` | Corrected the same way; additionally retains the legacy hand-formula builder, used only for `hash_mode='sha256_double'`. |
+| `v16/pipeline/` | **Stale — still carries the off-by-one.** Untouched by the position fix. Do not generate a lock from it. |
+
+The fix (PR #4, merged in `2c91720`) replaced hand-derived stack-position
+formulas with a live stack model. The old formulas omitted the `OP_0`
+CHECKMULTISIG dummy, used a fixed commitment gap that must shrink each
+iteration, and ignored cross-round drift — together producing an **unspendable**
+lock. The same commit corrected the SIGHASH_SINGLE bug value from `1` to
+`2**248` (Bitcoin Core returns `uint256::ONE`, whose little-endian bytes are
+read big-endian by secp256k1's `msg32`).
+
+`hash_mode='sha256_double'` (Config D) is **not** consensus-corrected in any
+tree. `pipeline/` now raises rather than silently emitting a mismatched script.
+
+### Stale generated artifacts
+
+Everything below was generated **before** the position fix landed, so it encodes
+the old `OP_ROLL` depths and must be regenerated before use:
+
+- `script/script_*.txt` — generated locking scripts
+- `transactions/*.hex` — funding/spending txs built from those scripts
+- `pipeline/*.bin`, `pipeline/gpu_*_params.json` — GPU search inputs
+- `pipeline/qsb_scriptpubkey.hex`, `pipeline/qsb_funding_tx.hex`
+- `v16/results/*.txt` — hits found against the pre-fix script
+
+Regenerate via `pipeline/qsb_pipeline.py setup` / `export`, and gate the result
+on `verifier/` (libbitcoinconsensus) before committing funds.
 
 ### Files not in this repository
 
