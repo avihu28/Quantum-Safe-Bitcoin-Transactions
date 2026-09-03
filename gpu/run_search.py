@@ -234,8 +234,8 @@ def run_full(diff, max_subsets=50000):
     print("\nPython pinning (to get locktime)...")
     try:
         from secp256k1 import ecdsa_recover, compress_pubkey
-        from search_v2 import is_valid_der_easy
-        check_fn = is_valid_der_easy if diff else None
+        from secp256k1 import is_valid_der_sig
+        check_fn = is_valid_der_sig if not diff else None
         if diff == 16:
             check_fn = lambda d: len(d) >= 9 and (d[0] >> 4) == 3
         elif diff == 256:
