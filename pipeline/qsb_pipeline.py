@@ -40,7 +40,7 @@ from secp256k1 import (
     sha256d, ripemd160, hash160,
     compress_pubkey, decompress_pubkey, point_mul, point_add, G, N, P,
     ecdsa_sign, ecdsa_sign_with_k, ecdsa_recover, ecdsa_verify,
-    encode_der_sig, is_valid_der_sig, modinv, int_to_der_int,
+    encode_der_sig, is_valid_der_sig, parse_der, modinv, int_to_der_int,
 )
 from bitcoin_tx import (
     Transaction, TxIn, TxOut, QSBScriptBuilder,
@@ -537,34 +537,6 @@ def cmd_export(args):
 # ============================================================
 # Phase 4: Assemble transaction
 # ============================================================
-
-def parse_der(sig_bytes):
-    """Parse DER-encoded signature into (r, s) integers.
-    Handles optional sighash suffix byte.
-    Returns (None, None) if not valid DER."""
-    if len(sig_bytes) < 8:
-        return None, None
-    d = sig_bytes
-    try:
-        if d[0] != 0x30: return None, None
-        tl = d[1]
-        # Check if there's a sighash byte after DER
-        if tl + 2 == len(d) - 1:
-            d = d[:-1]  # strip sighash
-        idx = 2
-        if d[idx] != 0x02: return None, None
-        idx += 1
-        rl = d[idx]; idx += 1
-        r = int.from_bytes(d[idx:idx+rl], 'big')
-        idx += rl
-        if d[idx] != 0x02: return None, None
-        idx += 1
-        sl = d[idx]; idx += 1
-        s = int.from_bytes(d[idx:idx+sl], 'big')
-        return r, s
-    except (IndexError, ValueError):
-        return None, None
-
 
 def cmd_assemble(args):
     print("╔══════════════════════════════════════╗")

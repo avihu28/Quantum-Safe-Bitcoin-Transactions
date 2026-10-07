@@ -228,6 +228,29 @@ def is_valid_der_sig(data):
     return True
 
 
+def parse_der(data):
+    """
+    Parse (r, s) from a DER-encoded ECDSA signature (with sighash byte).
+    Returns (r, s) as integers, or (None, None) if invalid.
+    """
+    if not is_valid_der_sig(data):
+        return None, None
+
+    idx = 2  # skip 0x30, length
+    # Parse r
+    assert data[idx] == 0x02
+    r_len = data[idx + 1]
+    idx += 2
+    r = int.from_bytes(data[idx:idx + r_len], 'big')
+    idx += r_len
+    # Parse s
+    assert data[idx] == 0x02
+    s_len = data[idx + 1]
+    idx += 2
+    s = int.from_bytes(data[idx:idx + s_len], 'big')
+    return r, s
+
+
 # ============================================================
 # SIGHASH_SINGLE bug: z = 1
 # ============================================================
