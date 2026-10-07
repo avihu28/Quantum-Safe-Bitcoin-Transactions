@@ -187,14 +187,18 @@ def check_structural(script, cfg, label="struct"):
 
     hash160_count = 0
     checkmultisig_count = 0
+    checkmultisigverify_count = 0
     for b in script:
         if b == 0xa9:
             hash160_count += 1
         elif b == 0xae:
             checkmultisig_count += 1
+        elif b == 0xaf:
+            checkmultisigverify_count += 1
 
     lines.append(f"[{label}] OP_HASH160 count: {hash160_count} (expected {expected_hash160})")
-    lines.append(f"[{label}] OP_CHECKMULTISIG count: {checkmultisig_count} (expected 2)")
+    lines.append(f"[{label}] OP_CHECKMULTISIG/VERIFY bytes (naive): "
+                 f"{checkmultisig_count}/{checkmultisigverify_count}")
 
     # Note: naive byte counting for non-push opcodes is imprecise because
     # data-push bytes can equal opcode values by chance. But HASH160 (0xa9)
@@ -205,6 +209,8 @@ def check_structural(script, cfg, label="struct"):
     # Proper opcode parse
     h160 = 0
     cms = 0
+    cmsv = 0
+    last_multisig = None
     i = 0
     while i < len(script):
         op = script[i]
@@ -226,17 +232,40 @@ def check_structural(script, cfg, label="struct"):
                 h160 += 1
             elif op == 0xae:
                 cms += 1
+                last_multisig = 0xae
+            elif op == 0xaf:
+                cmsv += 1
+                last_multisig = 0xaf
             i += 1
 
     lines.append(f"[{label}] OP_HASH160 (opcode-parsed): {h160} (expected {expected_hash160})")
-    lines.append(f"[{label}] OP_CHECKMULTISIG (opcode-parsed): {cms} (expected 2)")
+    lines.append(f"[{label}] digest-binding (opcode-parsed): {cmsv} CHECKMULTISIGVERIFY "
+                 f"+ {cms} CHECKMULTISIG (last=0x{(last_multisig or 0):02x})")
 
     if h160 != expected_hash160:
         lines.append(f"[{label}] ❌ HORS check count mismatch")
         ok = False
-    if cms != 2:
-        lines.append(f"[{label}] ❌ CHECKMULTISIG count wrong (R must be 2)")
-        ok = False
+
+    # Digest-binding shape. Legacy consensus checks ONLY the top stack item at
+    # script end, so a non-terminal round MUST end in OP_CHECKMULTISIGVERIFY —
+    # otherwise its multisig result is left buried and unenforced under the next
+    # round (the round-0 binding hole). The terminal round keeps plain
+    # OP_CHECKMULTISIG, whose result IS the script's result on top.
+    if cfg['hash_mode'] == 'sha256_double':
+        # Config D uses the legacy concatenation path (deprecated / over-budget,
+        # NOT consensus-corrected); it still emits 2 plain CHECKMULTISIG.
+        if cms != 2 or cmsv != 0:
+            lines.append(f"[{label}] ❌ legacy shape wrong: expected 2 CHECKMULTISIG, "
+                         f"0 CHECKMULTISIGVERIFY; got cms={cms} cmsv={cmsv}")
+            ok = False
+    else:
+        # Single-hash (consensus-corrected) path: round 0 VERIFYs, round 1 terminal.
+        if not (cmsv == 1 and cms == 1 and last_multisig == 0xae):
+            lines.append(f"[{label}] ❌ digest-binding shape wrong: expected exactly 1 "
+                         f"CHECKMULTISIGVERIFY (round 0) then 1 terminal CHECKMULTISIG "
+                         f"(round 1); got cmsv={cmsv} cms={cms} "
+                         f"last=0x{(last_multisig or 0):02x}")
+            ok = False
 
     if ok:
         lines.append(f"[{label}] ✅ structure matches config")

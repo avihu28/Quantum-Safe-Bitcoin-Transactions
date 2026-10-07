@@ -190,7 +190,7 @@ for k,v in toks(lock_relaxed):
     elif op==0xad:
         pub=st.pop();sig=st.pop()
         if not csig(sig,pub,[sig]) and fail is None: fail=('CHECKSIG',)
-    elif op==0xae:
+    elif op in (0xae,0xaf):
         nk=di(st.pop()); pubs=[st.pop() for _ in range(nk)][::-1]
         ns=di(st.pop()); sigs=[st.pop() for _ in range(ns)][::-1]; st.pop()
         allcs=[x for x in sigs if parse_der(x)]; si=0; mt=0
@@ -201,6 +201,7 @@ for k,v in toks(lock_relaxed):
             else: break
         st.append(b'\x01' if mt==ns else b''); cms+=1
         if mt!=ns and fail is None: fail=('CMS',mt,ns)
+        if op==0xaf: st.pop()
     peak=max(peak,len(st))
 truthy=bool(st) and any(x!=0 for x in st[-1])
 print(f"  [mine] HORS {hp}/15  CMS {cms}/2  peak_stack {peak}  TRUE={truthy}  fail={fail}")
