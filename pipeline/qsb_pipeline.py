@@ -53,12 +53,18 @@ STATE_FILE = "qsb_state.json"
 
 def puzzle_hash(pubkey_bytes, hash_mode='ripemd160', hash_choice=0):
     """Compute the puzzle hash for a compressed pubkey.
-    
+
+    This MUST match what the lock computes at the puzzle step
+    (build_pinning_script / _emit_round), because the result is the
+    sig_puzzle that OP_CHECKSIGVERIFY must accept:
+      ripemd160 -> OP_RIPEMD160 -> ripemd160(pubkey)   (not HASH160)
+      sha256    -> OP_SHA256    -> sha256(pubkey)
+
     Returns (hash_bytes, is_valid_der, hash_choice_used).
     Tries SHA256, then SHA256(SHA256) for double mode.
     """
     if hash_mode == 'ripemd160':
-        h = ripemd160(hashlib.sha256(pubkey_bytes).digest())
+        h = ripemd160(pubkey_bytes)
         return h, is_valid_der_sig(h), 0
     elif hash_mode == 'sha256':
         h = hashlib.sha256(pubkey_bytes).digest()
@@ -76,6 +82,42 @@ def puzzle_hash(pubkey_bytes, hash_mode='ripemd160', hash_choice=0):
         return h1, False, 0
     else:
         raise ValueError(f"Unknown hash_mode: {hash_mode}")
+
+
+def recover_pubkeys(r, s, z):
+    """Yield (compressed_pubkey, flag, used_r_plus_n) for every public key
+    that verifies the ECDSA signature (r, s) over z.
+
+    Consensus only checks R.x mod N == r, so R.x may be r or, when
+    r + N < P, r + N. The v16 GPU kernels accept a puzzle hit when either
+    value is on the curve (gpu_der_r_on_curve), so assembly must try both,
+    as config_a/pipeline already does. Each key is checked with
+    ecdsa_verify before it is yielded.
+    """
+    for rx in [r] + ([r + N] if r + N < P else []):
+        for flag in (0, 1):
+            pt = ecdsa_recover(rx, s, z, flag)
+            if pt and ecdsa_verify(pt, z, r, s):
+                yield compress_pubkey(pt), flag, rx != r
+
+
+def find_key_nonce(r, s, z, hash_mode):
+    """Recover key_nonce from its signature (r, s) over z.
+
+    Returns (key_nonce, sig_puzzle, flag, used_r_plus_n) for the key whose
+    puzzle hash, computed exactly as the lock computes it, is valid DER,
+    or None when no recovered key solves the puzzle for this hash_mode.
+    """
+    for kn, flag, plus_n in recover_pubkeys(r, s, z):
+        h, valid, _ = puzzle_hash(kn, hash_mode)
+        if valid:
+            return kn, h, flag, plus_n
+    return None
+
+
+def _r_label(plus_n):
+    return 'r+N' if plus_n else 'r'
+
 
 def compute_sha256_midstate(data, num_blocks):
     """Compute SHA-256 intermediate state after processing num_blocks full blocks."""
@@ -578,6 +620,10 @@ def cmd_assemble(args):
     t1 = state['t1s'] + state['t1b']
     t2 = state['t2s'] + state['t2b']
     hash_mode = state.get('hash_mode', 'ripemd160')
+    if hash_mode not in ('ripemd160', 'sha256'):
+        print(f"  ERROR: assemble supports single-hash locks only (ripemd160, sha256); "
+              f"hash_mode={hash_mode!r} is not consensus-corrected.")
+        return
     
     locktime = args.locktime
     sequence = args.sequence
@@ -622,26 +668,17 @@ def cmd_assemble(args):
     pin_sc = find_and_delete(full_script, pin_sig)
     z_pin = tx.sighash(QSB_INPUT_INDEX, pin_sc, sighash_type=0x01)
     
-    key_nonce_pin = None
-    sig_puzzle_pin = None
-    for flag in [0, 1]:
-        pt = ecdsa_recover(pin_r, pin_s, z_pin, flag)
-        if pt:
-            kn = compress_pubkey(pt)
-            h1 = hashlib.sha256(kn).digest()
-            if is_valid_der_sig(h1):
-                key_nonce_pin = kn; sig_puzzle_pin = h1
-                print(f"    key_nonce: {b2h(kn)[:16]}... (flag={flag}, SHA-256)")
-                break
-            h2 = hashlib.sha256(h1).digest()
-            if is_valid_der_sig(h2):
-                key_nonce_pin = kn; sig_puzzle_pin = h2
-                print(f"    key_nonce: {b2h(kn)[:16]}... (flag={flag}, SHA-256²)")
-                break
-    
-    if key_nonce_pin is None:
-        print("    ERROR: could not recover pinning key_nonce!")
+    # Only accept a puzzle hash the lock actually computes: a ripemd160 lock
+    # runs OP_RIPEMD160, a sha256 lock runs a single OP_SHA256 (an
+    # SHA-256(SHA-256) "hit" is not spendable against it).
+    found = find_key_nonce(pin_r, pin_s, z_pin, hash_mode)
+    if found is None:
+        print(f"    ERROR: could not recover pinning key_nonce "
+              f"(no recovered key solves the {hash_mode} puzzle)!")
         return
+    key_nonce_pin, sig_puzzle_pin, flag, plus_n = found
+    print(f"    key_nonce: {b2h(key_nonce_pin)[:16]}... "
+          f"(flag={flag}, {_r_label(plus_n)}, {hash_mode})")
     
     # Step 2: Pinning — recover key_puzzle
     print("\n  [2] Pinning: recover key_puzzle")
@@ -658,12 +695,11 @@ def cmd_assemble(args):
     z_puzzle_pin = tx.sighash(QSB_INPUT_INDEX, puzzle_sc, sighash_type=sp_sighash_type)
     
     key_puzzle_pin = None
-    for flag in [0, 1]:
-        pt = ecdsa_recover(sp_r, sp_s, z_puzzle_pin, flag)
-        if pt:
-            key_puzzle_pin = compress_pubkey(pt)
-            print(f"    key_puzzle: {b2h(key_puzzle_pin)[:16]}... (flag={flag})")
-            break
+    for kp, flag, plus_n in recover_pubkeys(sp_r, sp_s, z_puzzle_pin):
+        key_puzzle_pin = kp
+        print(f"    key_puzzle: {b2h(key_puzzle_pin)[:16]}... "
+              f"(flag={flag}, {_r_label(plus_n)})")
+        break
     
     if key_puzzle_pin is None:
         print("    ERROR: could not recover pinning key_puzzle!")
@@ -690,21 +726,14 @@ def cmd_assemble(args):
         
         z_round = tx.sighash(QSB_INPUT_INDEX, sc, sighash_type=0x01)
         
-        key_nonce_round = None
-        sig_puzzle_round = None
-        for flag in [0, 1]:
-            pt = ecdsa_recover(r_val, s_val, z_round, flag)
-            if pt:
-                kn = compress_pubkey(pt)
-                sp, real_der, hc = puzzle_hash(kn, hash_mode)
-                if real_der:
-                    key_nonce_round = kn; sig_puzzle_round = sp
-                    print(f"    key_nonce: {b2h(kn)[:16]}... (flag={flag}, hc={hc})")
-                    break
-        
-        if key_nonce_round is None:
-            print(f"    ERROR: round {ri+1} key_nonce recovery failed!")
+        found = find_key_nonce(r_val, s_val, z_round, hash_mode)
+        if found is None:
+            print(f"    ERROR: round {ri+1} key_nonce recovery failed "
+                  f"(no recovered key solves the {hash_mode} puzzle)!")
             return
+        key_nonce_round, sig_puzzle_round, flag, plus_n = found
+        print(f"    key_nonce: {b2h(key_nonce_round)[:16]}... "
+              f"(flag={flag}, {_r_label(plus_n)}, {hash_mode})")
         
         print(f"\n  [{4+ri*2}] Round {ri+1}: recover key_puzzle")
         
@@ -718,12 +747,11 @@ def cmd_assemble(args):
         puzzle_sc2 = find_and_delete(full_script, sig_puzzle_round)
         z_puzzle_round = tx.sighash(QSB_INPUT_INDEX, puzzle_sc2, sighash_type=sp_ht)
         key_puzzle_round = None
-        for flag in [0, 1]:
-            pt = ecdsa_recover(sp_r2, sp_s2, z_puzzle_round, flag)
-            if pt:
-                key_puzzle_round = compress_pubkey(pt)
-                print(f"    key_puzzle: {b2h(key_puzzle_round)[:16]}... (flag={flag})")
-                break
+        for kp, flag, plus_n in recover_pubkeys(sp_r2, sp_s2, z_puzzle_round):
+            key_puzzle_round = kp
+            print(f"    key_puzzle: {b2h(key_puzzle_round)[:16]}... "
+                  f"(flag={flag}, {_r_label(plus_n)})")
+            break
         if key_puzzle_round is None:
             print(f"    ERROR: round {ri+1} key_puzzle recovery failed!")
             return
@@ -740,11 +768,11 @@ def cmd_assemble(args):
             if dr is None:
                 print(f"    ERROR: dummy sig {idx} not valid DER!")
                 return
-            for flag in [0, 1]:
-                pt = ecdsa_recover(dr, ds_val, SIGHASH_SINGLE_BUG_Z, flag)
-                if pt:
-                    dummy_pubkeys.append(compress_pubkey(pt))
-                    break
+            dpk = next(recover_pubkeys(dr, ds_val, SIGHASH_SINGLE_BUG_Z), None)
+            if dpk is None:
+                print(f"    ERROR: failed to recover dummy pubkey for idx {idx}!")
+                return
+            dummy_pubkeys.append(dpk[0])
         
         signed_indices = indices[:ts]
         preimages = [h2b(state['hors_secrets'][ri][i]) for i in signed_indices]
