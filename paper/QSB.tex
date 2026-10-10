@@ -497,7 +497,7 @@ OP_{t+1}                   // M = t+1 signatures
 OP_2 OP_ROLL               // move key_nonce copy into pubkey zone
 {pos} OP_ROLL (x t)        // roll t dummy pubkeys from witness
 OP_{t+1}                   // N = t+1 public keys
-OP_CHECKMULTISIG           // verify t dummies + sig_nonce
+OP_CHECKMULTISIGVERIFY     // verify t dummies + sig_nonce (VERIFY: see "Two rounds")
 \end{lstlisting}
 
 \noindent Here~$\mathit{key}_{\mathrm{puzzle}}$ is derived by the spender via ECDSA key recovery from~$(\mathit{sig}_{\mathrm{puzzle}}, z)$---the same mechanism used throughout the scheme.
@@ -506,6 +506,8 @@ The per-round overhead compared to \textsc{Binohash} is $+4$ opcodes for the puz
 
 \paragraph{Two rounds.}
 The full scheme uses two independent rounds, each with its own pool of~$n$ dummy signatures, HORS commitments, and hardcoded~$\mathit{sig}_{\mathrm{nonce}}$. The full digest is the concatenation of the two rounds' selected subsets. The second round's script is identical in structure to the first; only the embedded data differs.
+
+Every round except the last must end in \texttt{OP\_CHECKMULTISIGVERIFY}, not \texttt{OP\_CHECKMULTISIG}. Legacy script validation checks only the top stack item when the script ends. A non-terminal \texttt{OP\_CHECKMULTISIG} leaves its boolean result on the stack, the next round's script runs on top of it, and the result is never inspected: a witness whose first-round subset does not solve the puzzle still validates, and the scheme's security collapses to a single round. The \texttt{VERIFY} variant aborts on failure and leaves nothing behind. The last round keeps plain \texttt{OP\_CHECKMULTISIG}, since its result is the script's final stack item. Note that the \texttt{VERIFY} variant pushes no result, so the \texttt{OP\_ROLL} depths in every later round shift by one relative to a script that used \texttt{OP\_CHECKMULTISIG} throughout.
 
 \begin{figure}[H]
 \centering
@@ -1056,13 +1058,17 @@ OP_2 OP_ROLL                    // move key_nonce into pubkey zone
 ...                             // (8 rolls total)
 302 OP_ROLL                     // roll pub_7
 OP_9                            // N = 9
-OP_CHECKMULTISIG                // verify all 9 sig/key pairs
+OP_CHECKMULTISIGVERIFY          // verify all 9 sig/key pairs; VERIFY, not
+                                // CHECKMULTISIG: a non-terminal result left on
+                                // the stack is never enforced by consensus
 
 
 // ============================================================
 // ROUND 2 (96 opcodes) -- same structure as Round 1
 // ============================================================
-// (identical structure, independent data)
+// (identical structure, independent data; OP_ROLL depths one
+//  less than Round 1, since CHECKMULTISIGVERIFY pushes nothing;
+//  ends in plain OP_CHECKMULTISIG, its result is the final item)
 ...
 \end{lstlisting}
 
